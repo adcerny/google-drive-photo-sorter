@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "PhotoSorter": {
+      "commandName": "Project",
+      "commandLineArgs": "-d \"G:\\My Drive\\My Pictures\\photos\""
+    }
+  }
+}

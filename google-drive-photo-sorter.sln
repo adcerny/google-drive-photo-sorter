@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.4.33103.184
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PhotoSorter", "PhotoSorter\PhotoSorter.csproj", "{32C530BA-B487-47BB-93BE-AC42CCA929EC}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "google-drive-photo-sorter", "google-drive-photo-sorter/google-drive-photo-sorter.csproj", "{32C530BA-B487-47BB-93BE-AC42CCA929EC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

@@ -83,8 +83,27 @@ namespace GoogleDrivePhotoSorter
             List<MediaFileInfo> files = GetFiles(_config, device);
             Log.Information($"Total phone files to process: {files.Count}");
 
+            // Determine files to upload.
+            var filesToUpload = new List<MediaFileInfo>();
+            foreach (var file in files)
+            {
+                var dateTaken = file.LastWriteTime.Value;
+                string yearFolderName = dateTaken.Year.ToString();
+                string monthFolderName = dateTaken.Month.ToString("00");
+
+                string targetFolderId = _appSettings.DriveFolderId;
+                targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, yearFolderName, targetFolderId, cancellationToken).ConfigureAwait(false);
+                targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, monthFolderName, targetFolderId, cancellationToken).ConfigureAwait(false);
+
+                if (!allFiles.ContainsKey(targetFolderId) || !allFiles[targetFolderId].ContainsKey(file.Name))
+                {
+                    filesToUpload.Add(file);
+                }
+            }
+
+            Log.Information($"Total files to upload: {filesToUpload.Count}");
+
             // Counters.
-            int filesToUpload = 0;
             int filesUploaded = 0;
             ConcurrentBag<string> failedFiles = new ConcurrentBag<string>();
 
@@ -93,7 +112,7 @@ namespace GoogleDrivePhotoSorter
             int baseRetryDelayMs = _appSettings.RetryDelayMs;
 
             // Process files concurrently.
-            await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken },
+            await Parallel.ForEachAsync(filesToUpload, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken },
                 async (file, token) =>
                 {
                     try
@@ -109,15 +128,6 @@ namespace GoogleDrivePhotoSorter
                         targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, yearFolderName, targetFolderId, token).ConfigureAwait(false);
                         targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, monthFolderName, targetFolderId, token).ConfigureAwait(false);
 
-                        // Skip if file exists.
-                        if (allFiles.ContainsKey(targetFolderId) &&
-                            allFiles[targetFolderId].ContainsKey(file.Name))
-                        {
-                            Log.Information($"File {file.Name} already exists at {driveRootDisplayName}/{yearFolderName}/{monthFolderName}. Skipping.");
-                            return;
-                        }
-
-                        Interlocked.Increment(ref filesToUpload);
                         string tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_{file.Name}");
 
                         // Exponential backoff for downloading.
@@ -134,6 +144,7 @@ namespace GoogleDrivePhotoSorter
                         Log.Information($"Uploaded file {file.Name} to Drive folder: {driveRootDisplayName}/{yearFolderName}/{monthFolderName}.");
 
                         Interlocked.Increment(ref filesUploaded);
+                        Log.Information($"Uploading file {filesUploaded} of {filesToUpload.Count}");
 
                         if (File.Exists(tempFilePath))
                             File.Delete(tempFilePath);
@@ -146,9 +157,8 @@ namespace GoogleDrivePhotoSorter
                 }).ConfigureAwait(false);
 
             Log.Information($"Processed {files.Count} files.");
-            Log.Information($"Total files marked for upload: {filesToUpload}");
             Log.Information($"Total files successfully uploaded: {filesUploaded}");
-            if (filesToUpload != filesUploaded)
+            if (filesToUpload.Count != filesUploaded)
             {
                 Log.Error("Tally mismatch: Some files were not uploaded.");
             }

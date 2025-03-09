@@ -23,9 +23,7 @@ namespace GoogleDrivePhotoSorter
     {
         // Global configuration object.
         static IConfigurationRoot _config;
-        // Values read from configuration.
-        static string ApplicationName;
-        static string DriveFolderId;
+        private static AppSettings _appSettings;
 
         // Use full Drive scope so you can create folders and upload files.
         static readonly string[] Scopes = { DriveService.Scope.Drive };
@@ -42,50 +40,26 @@ namespace GoogleDrivePhotoSorter
                 .Build();
 
             // Validate and load required config values.
-            ValidateAndLoadConfig(_config);
+            LoadConfiguration();
 
             // Start the global timer.
             var globalStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             Log.Information("Starting Google Drive Photo Sorter...");
 
-            await SortPhotosAsync(CancellationToken.None);
+            await SortPhotosAsync(CancellationToken.None).ConfigureAwait(false);
 
             globalStopwatch.Stop();
-            Log.Information($"Total process time: {globalStopwatch.Elapsed}");
+
+
+            //display the time taken to process all files formatted in a readable way
+            Log.Information($"Total time taken: {globalStopwatch.Elapsed.Hours} hours, {globalStopwatch.Elapsed.Minutes} minutes, {globalStopwatch.Elapsed.Seconds} seconds");
             Log.Information("Press any key to exit");
             Console.ReadKey();
         }
 
-        /// <summary>
-        /// Validates that required configuration values are present.
-        /// Throws an exception with a clear error message if any are missing.
-        /// Also loads global variables from config.
-        /// </summary>
-        private static void ValidateAndLoadConfig(IConfiguration config)
-        {
-            // Validate required string values.
-            foreach (var key in new[] { "ApplicationName", "DriveFolderId", "MaxRetries", "RetryDelayMs" })
-            {
-                if (string.IsNullOrWhiteSpace(config[key]))
-                {
-                    throw new Exception($"Missing required configuration value: {key}");
-                }
-            }
-            // Validate required array.
-            if (config.GetSection("DCIMPaths").Get<string[]>() == null)
-            {
-                throw new Exception("Missing required configuration value: DCIMPaths");
-            }
-
-            // Load global config values.
-            ApplicationName = config["ApplicationName"];
-            DriveFolderId = config["DriveFolderId"];
-        }
-
         static async Task SortPhotosAsync(CancellationToken cancellationToken)
         {
-
             // Locate the device.
             var device = GetDevice();
             if (device == null)
@@ -96,14 +70,14 @@ namespace GoogleDrivePhotoSorter
             device.Connect();
 
             // Authenticate with Google Drive.
-            var driveService = await AuthenticateDriveServiceAsync(cancellationToken);
+            var driveService = await AuthenticateDriveServiceAsync(cancellationToken).ConfigureAwait(false);
 
             // Get destination folder details.
-            var rootFolder = await driveService.Files.Get(DriveFolderId).ExecuteAsync(cancellationToken);
+            var rootFolder = await driveService.Files.Get(_appSettings.DriveFolderId).ExecuteAsync(cancellationToken).ConfigureAwait(false);
             string driveRootDisplayName = rootFolder.Name;
 
             // Build a lookup dictionary for files already in Drive.
-            var allFiles = await GetAllFilesRecursivelyAsync(driveService, DriveFolderId, cancellationToken);
+            var allFiles = await GetAllFilesRecursivelyAsync(driveService, _appSettings.DriveFolderId, cancellationToken).ConfigureAwait(false);
 
             // Retrieve list of photo files from the device.
             List<MediaFileInfo> files = GetFiles(_config, device);
@@ -115,8 +89,8 @@ namespace GoogleDrivePhotoSorter
             ConcurrentBag<string> failedFiles = new ConcurrentBag<string>();
 
             // Get retry settings.
-            int maxRetries = int.TryParse(_config["MaxRetries"], out int retries) ? retries : 3;
-            int baseRetryDelayMs = int.TryParse(_config["RetryDelayMs"], out int delay) ? delay : 500;
+            int maxRetries = _appSettings.MaxRetries;
+            int baseRetryDelayMs = _appSettings.RetryDelayMs;
 
             // Process files concurrently.
             await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken },
@@ -131,9 +105,9 @@ namespace GoogleDrivePhotoSorter
                         string yearFolderName = dateTaken.Year.ToString();
                         string monthFolderName = dateTaken.Month.ToString("00");
 
-                        string targetFolderId = DriveFolderId;
-                        targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, yearFolderName, targetFolderId, token);
-                        targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, monthFolderName, targetFolderId, token);
+                        string targetFolderId = _appSettings.DriveFolderId;
+                        targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, yearFolderName, targetFolderId, token).ConfigureAwait(false);
+                        targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, monthFolderName, targetFolderId, token).ConfigureAwait(false);
 
                         // Skip if file exists.
                         if (allFiles.ContainsKey(targetFolderId) &&
@@ -147,23 +121,7 @@ namespace GoogleDrivePhotoSorter
                         string tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_{file.Name}");
 
                         // Exponential backoff for downloading.
-                        int retryCount = 0;
-                        bool downloadSuccess = false;
-                        while (!downloadSuccess && retryCount < maxRetries)
-                        {
-                            try
-                            {
-                                await Task.Run(() => device.DownloadFile(file.FullName, tempFilePath), token);
-                                downloadSuccess = true;
-                            }
-                            catch (System.Runtime.InteropServices.COMException ex) when ((uint)ex.ErrorCode == 0x800700AA)
-                            {
-                                retryCount++;
-                                int delayMs = baseRetryDelayMs * (int)Math.Pow(2, retryCount);
-                                Log.Warning($"File {file.Name} is in use (attempt {retryCount}/{maxRetries}). Retrying in {delayMs}ms...");
-                                await Task.Delay(delayMs, token);
-                            }
-                        }
+                        bool downloadSuccess = await RetryDownloadAsync(device, file, tempFilePath, maxRetries, baseRetryDelayMs, token).ConfigureAwait(false);
                         if (!downloadSuccess)
                         {
                             Log.Error($"Skipping file {file.Name} after {maxRetries} attempts due to resource lock.");
@@ -172,7 +130,7 @@ namespace GoogleDrivePhotoSorter
                         }
 
                         // Upload file.
-                        await UploadFileAsync(driveService, tempFilePath, targetFolderId, token);
+                        await UploadFileAsync(driveService, tempFilePath, targetFolderId, token).ConfigureAwait(false);
                         Log.Information($"Uploaded file {file.Name} to Drive folder: {driveRootDisplayName}/{yearFolderName}/{monthFolderName}.");
 
                         Interlocked.Increment(ref filesUploaded);
@@ -185,7 +143,7 @@ namespace GoogleDrivePhotoSorter
                         Log.Error(ex, $"Error processing file {file.Name}");
                         failedFiles.Add(file.Name);
                     }
-                });
+                }).ConfigureAwait(false);
 
             Log.Information($"Processed {files.Count} files.");
             Log.Information($"Total files marked for upload: {filesToUpload}");
@@ -226,13 +184,13 @@ namespace GoogleDrivePhotoSorter
                     Scopes,
                     "user",
                     cancellationToken,
-                    new FileDataStore(credPath, true));
+                    new FileDataStore(credPath, true)).ConfigureAwait(false);
             }
 
             return new DriveService(new BaseClientService.Initializer()
             {
                 HttpClientInitializer = credential,
-                ApplicationName = ApplicationName,
+                ApplicationName = _appSettings.ApplicationName,
             });
         }
 
@@ -250,7 +208,7 @@ namespace GoogleDrivePhotoSorter
 
             try
             {
-                var uploadProgress = await request.UploadAsync(cancellationToken);
+                var uploadProgress = await request.UploadAsync(cancellationToken).ConfigureAwait(false);
                 if (uploadProgress.Status != UploadStatus.Completed)
                 {
                     if (uploadProgress.Exception is GoogleApiException gEx)
@@ -269,7 +227,7 @@ namespace GoogleDrivePhotoSorter
                 {
                     throw new Exception("Upload completed but response did not contain a valid file Id.");
                 }
-                Log.Information($"Uploaded file {Path.GetFileName(filePath)} successfully.");
+                Log.Information($"Uploaded file {Path.GetFileName(filePath)} to folder ID {parentFolderId}.");
             }
             catch (Exception ex)
             {
@@ -296,7 +254,7 @@ namespace GoogleDrivePhotoSorter
                     request.PageSize = 1000;
                     request.PageToken = pageToken;
 
-                    var result = await request.ExecuteAsync(cancellationToken);
+                    var result = await request.ExecuteAsync(cancellationToken).ConfigureAwait(false);
                     foreach (var file in result.Files)
                     {
                         folderDict[file.Name] = file;
@@ -316,10 +274,10 @@ namespace GoogleDrivePhotoSorter
                         subfolderTasks.Add(FetchFolderAsync(file.Id));
                     }
                 }
-                await Task.WhenAll(subfolderTasks);
+                await Task.WhenAll(subfolderTasks).ConfigureAwait(false);
             }
 
-            await FetchFolderAsync(rootFolderId);
+            await FetchFolderAsync(rootFolderId).ConfigureAwait(false);
             return allFiles;
         }
 
@@ -344,7 +302,7 @@ namespace GoogleDrivePhotoSorter
 
             var request = service.Files.Create(newFolder);
             request.Fields = "id, name, mimeType, parents";
-            var createdFolder = await request.ExecuteAsync(cancellationToken);
+            var createdFolder = await request.ExecuteAsync(cancellationToken).ConfigureAwait(false);
 
             if (!allFiles.ContainsKey(parentFolderId))
                 allFiles[parentFolderId] = new ConcurrentDictionary<string, Google.Apis.Drive.v3.Data.File>(StringComparer.OrdinalIgnoreCase);
@@ -414,6 +372,42 @@ namespace GoogleDrivePhotoSorter
             }
             Log.Information($"Total discovered files: {fileCount}");
             return files;
+        }
+
+        private static void LoadConfiguration()
+        {
+            _appSettings = new AppSettings();
+            _config.Bind(_appSettings);
+
+            //make sure every property of AppSettings is set using reflection
+            foreach (var prop in typeof(AppSettings).GetProperties())
+            {
+                if (prop.GetValue(_appSettings) == null)
+                {
+                    throw new Exception($"Missing configuration value for {prop.Name}");
+                }
+            }
+        }
+
+        private static async Task<bool> RetryDownloadAsync(MediaDevice device, MediaFileInfo file, string tempFilePath, int maxRetries, int baseRetryDelayMs, CancellationToken token)
+        {
+            int retryCount = 0;
+            while (retryCount < maxRetries)
+            {
+                try
+                {
+                    await Task.Run(() => device.DownloadFile(file.FullName, tempFilePath), token);
+                    return true;
+                }
+                catch (System.Runtime.InteropServices.COMException ex) when ((uint)ex.ErrorCode == 0x800700AA)
+                {
+                    retryCount++;
+                    int delayMs = baseRetryDelayMs * (int)Math.Pow(2, retryCount);
+                    Log.Warning($"File {file.Name} is in use (attempt {retryCount}/{maxRetries}). Retrying in {delayMs}ms...");
+                    await Task.Delay(delayMs, token);
+                }
+            }
+            return false;
         }
     }
 }

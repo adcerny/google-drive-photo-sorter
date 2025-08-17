@@ -16,6 +16,8 @@ using Google.Apis.Upload;
 using Google;
 using Serilog;
 using Serilog.Sinks.SystemConsole.Themes;
+using Google.Apis.Auth.OAuth2.Responses;
+using Google.Apis.Auth.OAuth2.Flows;
 
 namespace GoogleDrivePhotoSorter
 {
@@ -94,19 +96,77 @@ namespace GoogleDrivePhotoSorter
             int maxRetries = _appSettings.MaxRetries;
             int baseRetryDelayMs = _appSettings.RetryDelayMs;
 
-            int maxParallelism = Math.Max(2, Environment.ProcessorCount); // Or make configurable
+            // Producer-consumer: download buffer and parallel uploads
+            int maxParallelism = Math.Max(2, Environment.ProcessorCount); // Tune as needed
+            int downloadBufferSize = 3; // Number of files to prefetch
+            var downloadBuffer = new System.Collections.Concurrent.BlockingCollection<(MediaFileInfo file, string tempFilePath, long fileSize)>(downloadBufferSize);
+            var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-            // Process files concurrently.
-            await Parallel.ForEachAsync(filesToUpload, new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = cancellationToken },
-                async (file, token) =>
+            // Producer: download files to temp and add to buffer
+            var downloadTask = Task.Run(async () =>
+            {
+                try
                 {
-                    var uploaded = await ProcessFileAsync(
-                        file, device, driveService, allFiles, folderIdCache, driveRootDisplayName,
-                        maxRetries, baseRetryDelayMs, filesToUpload.Count, failedFiles, token
-                    ).ConfigureAwait(false);
-                    if (uploaded)
+                    foreach (var file in filesToUpload)
+                    {
+                        if (downloadCts.Token.IsCancellationRequested) break;
+                        long fileSize = (long)file.Length;
+                        string tempFilePath = Path.Combine(Path.GetTempPath(), file.Name);
+                        Log.Information($"Downloading: {file.Name} ({fileSize / 1024 / 1024.0:F2} MB)");
+                        bool downloadSuccess = await RetryDownloadToFileAsync(device, file, tempFilePath, maxRetries, baseRetryDelayMs, downloadCts.Token).ConfigureAwait(false);
+                        if (!downloadSuccess)
+                        {
+                            Log.Error($"Failed: {file.Name} ({fileSize / 1024 / 1024.0:F2} MB)");
+                            failedFiles.Add(file.Name);
+                            continue;
+                        }
+                        Log.Information($"Downloaded: {file.Name} ({fileSize / 1024 / 1024.0:F2} MB), waiting for upload...");
+                        downloadBuffer.Add((file, tempFilePath, fileSize), downloadCts.Token);
+                    }
+                }
+                finally
+                {
+                    downloadBuffer.CompleteAdding();
+                    Log.Information("Download complete.");
+                }
+            }, downloadCts.Token);
+
+            // Consumer: upload files from buffer in parallel
+            await Parallel.ForEachAsync(downloadBuffer.GetConsumingEnumerable(), new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = cancellationToken },
+                async (item, token) =>
+                {
+                    var (file, tempFilePath, fileSize) = item;
+                    try
+                    {
+                        var dateTaken = file.LastWriteTime ?? DateTime.MinValue;
+                        var yearFolderName = dateTaken.Year.ToString();
+                        var monthFolderName = dateTaken.Month.ToString("00");
+                        var targetFolderId = _appSettings.DriveFolderId;
+                        targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, yearFolderName, targetFolderId, token).ConfigureAwait(false);
+                        targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, monthFolderName, targetFolderId, token).ConfigureAwait(false);
+                        Log.Information($"Uploading: {file.Name} ({fileSize / 1024 / 1024.0:F2} MB)");
+                        await UploadFileAsync(driveService, tempFilePath, targetFolderId, token).ConfigureAwait(false);
+                        Log.Information($"Uploaded: {file.Name} ({fileSize / 1024 / 1024.0:F2} MB)");
                         Interlocked.Increment(ref filesUploaded);
+                        Log.Information($"Total Progress: {filesUploaded}/{filesToUpload.Count}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"Error uploading: {file.Name} ({fileSize / 1024 / 1024.0:F2} MB) - {ex.Message}");
+                        failedFiles.Add(file.Name);
+                    }
+                    finally
+                    {
+                        if (File.Exists(tempFilePath))
+                        {
+                            File.Delete(tempFilePath);
+                            // Don't log deleted temp file, just update status
+                        }
+                    }
                 }).ConfigureAwait(false);
+
+            // Wait for producer to finish
+            await downloadTask.ConfigureAwait(false);
 
             Log.Information($"Processed {files.Count} files.");
             Log.Information($"Total files successfully uploaded: {filesUploaded}");
@@ -192,26 +252,30 @@ namespace GoogleDrivePhotoSorter
                 targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, yearFolderName, targetFolderId, token).ConfigureAwait(false);
                 targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, monthFolderName, targetFolderId, token).ConfigureAwait(false);
 
-                var tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_{file.Name}");
-
-                // Pass device to RetryDownloadAsync
-                bool downloadSuccess = await RetryDownloadAsync(device, file, tempFilePath, maxRetries, baseRetryDelayMs, token).ConfigureAwait(false);
+                Log.Information($"Starting download of {file.Name} from device to temp file...");
+                string tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_{file.Name}");
+                bool downloadSuccess = await RetryDownloadToFileAsync(device, file, tempFilePath, maxRetries, baseRetryDelayMs, token).ConfigureAwait(false);
                 if (!downloadSuccess)
                 {
                     Log.Error($"Skipping file {file.Name} after {maxRetries} attempts due to resource lock.");
                     failedFiles.Add(file.Name);
                     return false;
                 }
-
-                // Upload file.
-                await UploadFileAsync(driveService, tempFilePath, targetFolderId, token).ConfigureAwait(false);
-                Log.Information($"Uploaded file {file.Name} to Drive folder: {driveRootDisplayName}/{yearFolderName}/{monthFolderName}.");
-
-                Log.Information($"Uploading file (progress unknown in parallel loop)");
-
-                if (File.Exists(tempFilePath))
-                    File.Delete(tempFilePath);
-
+                Log.Information($"Download of {file.Name} complete. Starting upload to Google Drive...");
+                try
+                {
+                    await UploadFileAsync(driveService, tempFilePath, targetFolderId, token).ConfigureAwait(false);
+                    Log.Information($"Uploaded file {file.Name} to Drive folder: {driveRootDisplayName}/{yearFolderName}/{monthFolderName}.");
+                }
+                finally
+                {
+                    if (File.Exists(tempFilePath))
+                    {
+                        File.Delete(tempFilePath);
+                        Log.Information($"Deleted temp file for {file.Name}.");
+                    }
+                }
+                Log.Information($"Finished processing file {file.Name}.");
                 return true;
             }
             catch (Exception ex)
@@ -233,12 +297,17 @@ namespace GoogleDrivePhotoSorter
             }
 
             using var stream = new FileStream(CredentialsPath, FileMode.Open, FileAccess.Read);
+            var secrets = GoogleClientSecrets.Load(stream).Secrets;
+
+            // Use LocalServerCodeReceiver to force system browser for OAuth
             var credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
-                GoogleClientSecrets.Load(stream).Secrets,
+                secrets,
                 Scopes,
                 "user",
                 cancellationToken,
-                new FileDataStore(TokenPath, true)).ConfigureAwait(false);
+                new FileDataStore(TokenPath, true),
+                new LocalServerCodeReceiver() // <--- This line ensures browser-based auth
+            ).ConfigureAwait(false);
 
             return new DriveService(new BaseClientService.Initializer()
             {
@@ -468,21 +537,47 @@ namespace GoogleDrivePhotoSorter
             }
         }
 
-        private static async Task<bool> RetryDownloadAsync(MediaDevice device, MediaFileInfo file, string tempFilePath, int maxRetries, int baseRetryDelayMs, CancellationToken token)
+        // Semaphore for MTP download concurrency
+        private static readonly SemaphoreSlim _mtpSemaphore = new SemaphoreSlim(1, 1);
+
+    // Download from device to a stream, with retries, and return the stream (positioned at 0)
+    // (Progress bar version removed)
+
+        // Add the missing RetryDownloadToFileAsync method implementation to resolve the CS0103 error.  
+        private static async Task<bool> RetryDownloadToFileAsync(MediaDevice device, MediaFileInfo file, string tempFilePath, int maxRetries, int baseRetryDelayMs, CancellationToken token)
         {
             int retryCount = 0;
             while (retryCount < maxRetries)
             {
                 try
                 {
-                    await Task.Run(() => device.DownloadFile(file.FullName, tempFilePath), token);
-                    return true;
+                    // Ensure only one download at a time using semaphore  
+                    await _mtpSemaphore.WaitAsync(token);
+                    try
+                    {
+                        // Small delay before each attempt (MTP best practice)  
+                        await Task.Delay(100, token);
+
+                        // Optionally, refresh the parent directory to avoid stale handles  
+                        var parentDir = Path.GetDirectoryName(file.FullName);
+                        if (!string.IsNullOrEmpty(parentDir))
+                        {
+                            device.EnumerateFiles(parentDir).ToList();
+                        }
+
+                        // Download the file to the specified temp file path  
+                        device.DownloadFile(file.FullName, tempFilePath);
+                        return true;
+                    }
+                    finally
+                    {
+                        _mtpSemaphore.Release();
+                    }
                 }
                 catch (System.Runtime.InteropServices.COMException ex) when ((uint)ex.ErrorCode == 0x800700AA)
                 {
                     retryCount++;
                     int delayMs = baseRetryDelayMs * (int)Math.Pow(2, retryCount);
-                    Log.Warning($"File {file.Name} is in use (attempt {retryCount}/{maxRetries}). Retrying in {delayMs}ms...");
                     await Task.Delay(delayMs, token);
                 }
             }

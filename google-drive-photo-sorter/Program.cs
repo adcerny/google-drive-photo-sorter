@@ -28,132 +28,84 @@ namespace GoogleDrivePhotoSorter
         // Use full Drive scope so you can create folders and upload files.
         static readonly string[] Scopes = { DriveService.Scope.Drive };
 
+        // Constants
+        private const string CredentialsPath = "credentials.json";
+        private const string TokenPath = "token.json";
+        private const int DefaultPageSize = 1000;
+        private const string FolderMimeType = "application/vnd.google-apps.folder";
+
         static async Task Main(string[] args)
         {
-            Log.Logger = new LoggerConfiguration()
-                .WriteTo.Console(theme: SystemConsoleTheme.Colored)
-                .CreateLogger();
-
-            // Load configuration from appsettings.json.
-            _config = new ConfigurationBuilder()
-                .AddJsonFile("appsettings.json", optional: false)
-                .Build();
-
-            // Validate and load required config values.
+            ConfigureLogger();
             LoadConfiguration();
 
-            // Start the global timer.
             var globalStopwatch = System.Diagnostics.Stopwatch.StartNew();
-
             Log.Information("Starting Google Drive Photo Sorter...");
 
             await SortPhotosAsync(CancellationToken.None).ConfigureAwait(false);
 
             globalStopwatch.Stop();
-
-
-            //display the time taken to process all files formatted in a readable way
-            Log.Information($"Total time taken: {globalStopwatch.Elapsed.Hours} hours, {globalStopwatch.Elapsed.Minutes} minutes, {globalStopwatch.Elapsed.Seconds} seconds");
+            Log.Information($"Total time taken: {FormatElapsed(globalStopwatch.Elapsed)}");
             Log.Information("Press any key to exit");
             Console.ReadKey();
         }
 
+        private static void ConfigureLogger()
+        {
+            Log.Logger = new LoggerConfiguration()
+                .WriteTo.Console(theme: SystemConsoleTheme.Colored)
+                .CreateLogger();
+        }
+
+        private static string FormatElapsed(TimeSpan elapsed) =>
+            $"{elapsed.Hours} hours, {elapsed.Minutes} minutes, {elapsed.Seconds} seconds";
+
         static async Task SortPhotosAsync(CancellationToken cancellationToken)
         {
             // Locate the device.
-            var device = GetDevice();
+            using var device = GetDevice();
             if (device == null)
             {
-                Log.Error("No device found.");
+                Log.Error("No device found or device selection was cancelled.");
                 return;
             }
             device.Connect();
 
             // Authenticate with Google Drive.
             var driveService = await AuthenticateDriveServiceAsync(cancellationToken).ConfigureAwait(false);
-
-            // Get destination folder details.
-            var rootFolder = await driveService.Files.Get(_appSettings.DriveFolderId).ExecuteAsync(cancellationToken).ConfigureAwait(false);
-            string driveRootDisplayName = rootFolder.Name;
-
-            // Build a lookup dictionary for files already in Drive.
+            var driveRootDisplayName = await GetDriveRootDisplayNameAsync(driveService, cancellationToken).ConfigureAwait(false);
             var allFiles = await GetAllFilesRecursivelyAsync(driveService, _appSettings.DriveFolderId, cancellationToken).ConfigureAwait(false);
-
-            // Retrieve list of photo files from the device.
-            List<MediaFileInfo> files = GetFiles(_config, device);
+            var files = GetFiles(_config, device);
             Log.Information($"Total phone files to process: {files.Count}");
 
+            // Cache for created folder IDs to avoid redundant Drive API calls
+            var folderIdCache = new ConcurrentDictionary<(string ParentId, string FolderName), string>(EqualityComparer<(string ParentId, string FolderName)>.Default);
+
             // Determine files to upload.
-            var filesToUpload = new List<MediaFileInfo>();
-            foreach (var file in files)
-            {
-                var dateTaken = file.LastWriteTime.Value;
-                string yearFolderName = dateTaken.Year.ToString();
-                string monthFolderName = dateTaken.Month.ToString("00");
-
-                string targetFolderId = _appSettings.DriveFolderId;
-                targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, yearFolderName, targetFolderId, cancellationToken).ConfigureAwait(false);
-                targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, monthFolderName, targetFolderId, cancellationToken).ConfigureAwait(false);
-
-                if (!allFiles.ContainsKey(targetFolderId) || !allFiles[targetFolderId].ContainsKey(file.Name))
-                {
-                    filesToUpload.Add(file);
-                }
-            }
+            var filesToUpload = GetFilesToUpload(files, allFiles, driveService, folderIdCache, cancellationToken).Result;
 
             Log.Information($"Total files to upload: {filesToUpload.Count}");
 
             // Counters.
             int filesUploaded = 0;
-            ConcurrentBag<string> failedFiles = new ConcurrentBag<string>();
+            var failedFiles = new ConcurrentBag<string>();
 
             // Get retry settings.
             int maxRetries = _appSettings.MaxRetries;
             int baseRetryDelayMs = _appSettings.RetryDelayMs;
 
+            int maxParallelism = Math.Max(2, Environment.ProcessorCount); // Or make configurable
+
             // Process files concurrently.
-            await Parallel.ForEachAsync(filesToUpload, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken },
+            await Parallel.ForEachAsync(filesToUpload, new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = cancellationToken },
                 async (file, token) =>
                 {
-                    try
-                    {
-                        var dateTaken = file.LastWriteTime.Value;
-                        Log.Information($"Processing file {file.Name} - date taken: {dateTaken}");
-
-                        // Folder structure: Year/Month.
-                        string yearFolderName = dateTaken.Year.ToString();
-                        string monthFolderName = dateTaken.Month.ToString("00");
-
-                        string targetFolderId = _appSettings.DriveFolderId;
-                        targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, yearFolderName, targetFolderId, token).ConfigureAwait(false);
-                        targetFolderId = await GetOrCreateFolderAsync(driveService, allFiles, monthFolderName, targetFolderId, token).ConfigureAwait(false);
-
-                        string tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_{file.Name}");
-
-                        // Exponential backoff for downloading.
-                        bool downloadSuccess = await RetryDownloadAsync(device, file, tempFilePath, maxRetries, baseRetryDelayMs, token).ConfigureAwait(false);
-                        if (!downloadSuccess)
-                        {
-                            Log.Error($"Skipping file {file.Name} after {maxRetries} attempts due to resource lock.");
-                            failedFiles.Add(file.Name);
-                            return;
-                        }
-
-                        // Upload file.
-                        await UploadFileAsync(driveService, tempFilePath, targetFolderId, token).ConfigureAwait(false);
-                        Log.Information($"Uploaded file {file.Name} to Drive folder: {driveRootDisplayName}/{yearFolderName}/{monthFolderName}.");
-
+                    var uploaded = await ProcessFileAsync(
+                        file, device, driveService, allFiles, folderIdCache, driveRootDisplayName,
+                        maxRetries, baseRetryDelayMs, filesToUpload.Count, failedFiles, token
+                    ).ConfigureAwait(false);
+                    if (uploaded)
                         Interlocked.Increment(ref filesUploaded);
-                        Log.Information($"Uploading file {filesUploaded} of {filesToUpload.Count}");
-
-                        if (File.Exists(tempFilePath))
-                            File.Delete(tempFilePath);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Error(ex, $"Error processing file {file.Name}");
-                        failedFiles.Add(file.Name);
-                    }
                 }).ConfigureAwait(false);
 
             Log.Information($"Processed {files.Count} files.");
@@ -172,30 +124,121 @@ namespace GoogleDrivePhotoSorter
             }
         }
 
+        private static async Task<string> GetDriveRootDisplayNameAsync(DriveService driveService, CancellationToken cancellationToken)
+        {
+            var rootFolder = await driveService.Files.Get(_appSettings.DriveFolderId).ExecuteAsync(cancellationToken).ConfigureAwait(false);
+            return rootFolder.Name;
+        }
+
+        private static async Task<List<MediaFileInfo>> GetFilesToUpload(
+            List<MediaFileInfo> files,
+            ConcurrentDictionary<string, ConcurrentDictionary<string, Google.Apis.Drive.v3.Data.File>> allFiles,
+            DriveService driveService,
+            ConcurrentDictionary<(string ParentId, string FolderName), string> folderIdCache,
+            CancellationToken cancellationToken)
+        {
+            var filesToUpload = new List<MediaFileInfo>();
+            foreach (var file in files)
+            {
+                if (!file.LastWriteTime.HasValue)
+                {
+                    Log.Warning($"File {file.Name} does not have a valid LastWriteTime. Skipping.");
+                    continue;
+                }
+                var dateTaken = file.LastWriteTime.Value;
+                var yearFolderName = dateTaken.Year.ToString();
+                var monthFolderName = dateTaken.Month.ToString("00");
+
+                var targetFolderId = _appSettings.DriveFolderId;
+                targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, yearFolderName, targetFolderId, cancellationToken).ConfigureAwait(false);
+                targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, monthFolderName, targetFolderId, cancellationToken).ConfigureAwait(false);
+
+                if (!allFiles.ContainsKey(targetFolderId) || !allFiles[targetFolderId].ContainsKey(file.Name))
+                {
+                    filesToUpload.Add(file);
+                }
+            }
+            return filesToUpload;
+        }
+
+        private static async Task<bool> ProcessFileAsync(
+            MediaFileInfo file,
+            MediaDevice device,
+            DriveService driveService,
+            ConcurrentDictionary<string, ConcurrentDictionary<string, Google.Apis.Drive.v3.Data.File>> allFiles,
+            ConcurrentDictionary<(string ParentId, string FolderName), string> folderIdCache,
+            string driveRootDisplayName,
+            int maxRetries,
+            int baseRetryDelayMs,
+            int totalFiles,
+            ConcurrentBag<string> failedFiles,
+            CancellationToken token)
+        {
+            try
+            {
+                if (!file.LastWriteTime.HasValue)
+                {
+                    Log.Warning($"File {file.Name} does not have a valid LastWriteTime. Skipping.");
+                    failedFiles.Add(file.Name);
+                    return false;
+                }
+                var dateTaken = file.LastWriteTime.Value;
+                Log.Information($"Processing file {file.Name} - date taken: {dateTaken}");
+
+                var yearFolderName = dateTaken.Year.ToString();
+                var monthFolderName = dateTaken.Month.ToString("00");
+
+                var targetFolderId = _appSettings.DriveFolderId;
+                targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, yearFolderName, targetFolderId, token).ConfigureAwait(false);
+                targetFolderId = await GetOrCreateFolderCachedAsync(driveService, allFiles, folderIdCache, monthFolderName, targetFolderId, token).ConfigureAwait(false);
+
+                var tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}_{file.Name}");
+
+                // Pass device to RetryDownloadAsync
+                bool downloadSuccess = await RetryDownloadAsync(device, file, tempFilePath, maxRetries, baseRetryDelayMs, token).ConfigureAwait(false);
+                if (!downloadSuccess)
+                {
+                    Log.Error($"Skipping file {file.Name} after {maxRetries} attempts due to resource lock.");
+                    failedFiles.Add(file.Name);
+                    return false;
+                }
+
+                // Upload file.
+                await UploadFileAsync(driveService, tempFilePath, targetFolderId, token).ConfigureAwait(false);
+                Log.Information($"Uploaded file {file.Name} to Drive folder: {driveRootDisplayName}/{yearFolderName}/{monthFolderName}.");
+
+                Log.Information($"Uploading file (progress unknown in parallel loop)");
+
+                if (File.Exists(tempFilePath))
+                    File.Delete(tempFilePath);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Error processing file {file.Name}");
+                failedFiles.Add(file.Name);
+                return false;
+            }
+        }
+
         static async Task<DriveService> AuthenticateDriveServiceAsync(CancellationToken cancellationToken)
         {
-            UserCredential credential;
-
-            string credentialsPath = "credentials.json";
-
-            if (!File.Exists(credentialsPath))
+            if (!File.Exists(CredentialsPath))
             {
                 throw new FileNotFoundException(
-                    $"Missing Google API credentials file: {credentialsPath}\n" +
-                    $"Ensure you have a valid 'credentials.json' in the project root.\n" +
+                    $"Missing Google API credentials file: {CredentialsPath}\n" +
+                    $"Ensure you have a valid '{CredentialsPath}' in the project root.\n" +
                     $"Refer to 'credentials.json.example' for format.");
             }
 
-            using (var stream = new FileStream(credentialsPath, FileMode.Open, FileAccess.Read))
-            {
-                string credPath = "token.json";
-                credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
-                    GoogleClientSecrets.Load(stream).Secrets,
-                    Scopes,
-                    "user",
-                    cancellationToken,
-                    new FileDataStore(credPath, true)).ConfigureAwait(false);
-            }
+            using var stream = new FileStream(CredentialsPath, FileMode.Open, FileAccess.Read);
+            var credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
+                GoogleClientSecrets.Load(stream).Secrets,
+                Scopes,
+                "user",
+                cancellationToken,
+                new FileDataStore(TokenPath, true)).ConfigureAwait(false);
 
             return new DriveService(new BaseClientService.Initializer()
             {
@@ -261,7 +304,7 @@ namespace GoogleDrivePhotoSorter
                     var request = service.Files.List();
                     request.Q = $"'{folderId}' in parents and trashed=false";
                     request.Fields = "nextPageToken, files(id, name, mimeType, parents)";
-                    request.PageSize = 1000;
+                    request.PageSize = DefaultPageSize;
                     request.PageToken = pageToken;
 
                     var result = await request.ExecuteAsync(cancellationToken).ConfigureAwait(false);
@@ -276,14 +319,11 @@ namespace GoogleDrivePhotoSorter
                 Interlocked.Increment(ref foldersProcessed);
                 Log.Information($"Processed folder: {folderId} (Total folders processed: {foldersProcessed})");
 
-                var subfolderTasks = new List<Task>();
-                foreach (var file in folderDict.Values)
-                {
-                    if (file.MimeType == "application/vnd.google-apps.folder")
-                    {
-                        subfolderTasks.Add(FetchFolderAsync(file.Id));
-                    }
-                }
+                var subfolderTasks = folderDict.Values
+                    .Where(file => file.MimeType == FolderMimeType)
+                    .Select(file => FetchFolderAsync(file.Id))
+                    .ToList();
+
                 await Task.WhenAll(subfolderTasks).ConfigureAwait(false);
             }
 
@@ -298,7 +338,7 @@ namespace GoogleDrivePhotoSorter
         {
             if (allFiles.TryGetValue(parentFolderId, out var parentDict) &&
                 parentDict.TryGetValue(folderName, out var existingFolder) &&
-                existingFolder.MimeType == "application/vnd.google-apps.folder")
+                existingFolder.MimeType == FolderMimeType)
             {
                 return existingFolder.Id;
             }
@@ -306,7 +346,7 @@ namespace GoogleDrivePhotoSorter
             var newFolder = new Google.Apis.Drive.v3.Data.File
             {
                 Name = folderName,
-                MimeType = "application/vnd.google-apps.folder",
+                MimeType = FolderMimeType,
                 Parents = new List<string> { parentFolderId }
             };
 
@@ -341,7 +381,13 @@ namespace GoogleDrivePhotoSorter
                 {
                     Log.Information($"{i + 1}. {devices[i].FriendlyName}");
                 }
+                Log.Information("Enter device number (or press Enter to cancel):");
                 var deviceNumber = Console.ReadLine();
+                if (string.IsNullOrWhiteSpace(deviceNumber))
+                {
+                    Log.Warning("Device selection cancelled by user.");
+                    return null;
+                }
                 if (int.TryParse(deviceNumber, out int deviceIndex) && deviceIndex > 0 && deviceIndex <= devices.Count)
                 {
                     return devices[deviceIndex - 1];
@@ -354,16 +400,19 @@ namespace GoogleDrivePhotoSorter
             }
         }
 
+        // Parallelize file discovery for each camera path
         static List<MediaFileInfo> GetFiles(IConfigurationRoot config, MediaDevice device)
         {
             var dcimPaths = config.GetSection("DCIMPaths").Get<string[]>();
             var excludedPrefixes = config.GetSection("ExcludedPrefixes").Get<string[]>() ?? Array.Empty<string>();
-            List<MediaFileInfo> files = new();
+            var files = new ConcurrentBag<MediaFileInfo>();
             int fileCount = 0;
 
-            foreach (var path in device.EnumerateDirectories("/"))
+            var directories = device.EnumerateDirectories("/").ToList();
+
+            Parallel.ForEach(directories, dir =>
             {
-                var cameraPath = Path.Combine(path, "DCIM", "Camera");
+                var cameraPath = Path.Combine(dir, "DCIM", "Camera");
                 if (device.DirectoryExists(cameraPath))
                 {
                     var photoDir = device.GetDirectoryInfo(cameraPath);
@@ -372,21 +421,41 @@ namespace GoogleDrivePhotoSorter
                         if (excludedPrefixes.Any(prefix => file.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
                             continue;
                         files.Add(file);
-                        fileCount++;
-                        if (fileCount % 50 == 0)
+                        int count = Interlocked.Increment(ref fileCount);
+                        if (count % 50 == 0)
                         {
-                            Log.Information($"Discovered {fileCount} files so far...");
+                            Log.Information($"Discovered {count} files so far...");
                         }
                     }
                 }
-            }
+            });
+
             Log.Information($"Total discovered files: {fileCount}");
-            return files;
+            return files.ToList();
+        }
+
+        // Helper: cache folder IDs locally to avoid redundant Drive API calls
+        private static async Task<string> GetOrCreateFolderCachedAsync(
+            DriveService service,
+            ConcurrentDictionary<string, ConcurrentDictionary<string, Google.Apis.Drive.v3.Data.File>> allFiles,
+            ConcurrentDictionary<(string ParentId, string FolderName), string> folderIdCache,
+            string folderName, string parentFolderId, CancellationToken cancellationToken)
+        {
+            var key = (parentFolderId, folderName);
+            if (folderIdCache.TryGetValue(key, out var cachedId))
+                return cachedId;
+
+            var id = await GetOrCreateFolderAsync(service, allFiles, folderName, parentFolderId, cancellationToken).ConfigureAwait(false);
+            folderIdCache[key] = id;
+            return id;
         }
 
         private static void LoadConfiguration()
         {
             _appSettings = new AppSettings();
+            _config = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                .Build();
             _config.Bind(_appSettings);
 
             //make sure every property of AppSettings is set using reflection
